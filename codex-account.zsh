@@ -9,11 +9,17 @@
 #   codex-account save <name>    save the current login (fails if <name> exists)
 #   codex-account update <name>  overwrite a saved account with the current login
 #   codex-account remove <name>  delete a saved account (does not log out)
+#   codex-account login <name>   log in to another account safely and save it
 #
 # Accounts are copies of $CODEX_HOME/auth.json kept in $CODEX_HOME/accounts/.
 # Requires python3 (to decode the id_token for email / plan display).
+#
+# Why `login` exists: every plain `codex login` first revokes the refresh token
+# found in auth.json on the server (codex-rs: clear_existing_auth_before_login ->
+# logout_with_revoke). A saved copy of that token dies with it. `codex-account login`
+# parks auth.json before calling `codex login`, so nothing gets revoked.
 
-CODEX_ACCOUNT_VERSION="1.0.0"
+CODEX_ACCOUNT_VERSION="1.1.0"
 [[ -z "${CODEX_ACCOUNT_NO_ALIAS:-}" ]] && alias ca='codex-account'
 
 _codex_account_home() { printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"; }
@@ -66,17 +72,53 @@ _codex_account_files() {
 
 # Copies the live auth.json back into every saved account with the same account id,
 # so tokens refreshed by Codex are not lost when switching away.
+# Returns 1 when the live login is not saved under any name.
 _codex_account_sync_back() {
-  local home="$1" dir="$2" live_id f
-  [[ -f "$home/auth.json" ]] || return 0
+  local home="$1" dir="$2" live_id f matched=0
+  [[ -f "$home/auth.json" ]] || return 1
   live_id=$(_codex_account_id "$home/auth.json")
-  [[ "$live_id" == "?" ]] && return 0
+  [[ "$live_id" == "?" ]] && return 1
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     if [[ "$(_codex_account_id "$f")" == "$live_id" ]]; then
       cp "$home/auth.json" "$f"
+      matched=1
     fi
   done < <(_codex_account_files "$dir")
+  [[ "$matched" -eq 1 ]]
+}
+
+# Logs in to another account without revoking the current one:
+# sync the live login into its saved copy, park auth.json, run `codex login`, save the result.
+_codex_account_login() {
+  local home="$1" dir="$2" name="$3" parked="$dir/.auth.json.parked" id email plan old_id info
+  shift 3
+  [[ $# -gt 0 ]] || set -- --device-auth
+
+  if [[ -f "$home/auth.json" ]]; then
+    read -r id email plan < <(_codex_account_info "$home/auth.json")
+    if [[ "$id" != "?" ]] && ! _codex_account_sync_back "$home" "$dir"; then
+      echo "codex-account: the current login ($email) is not saved under any name and would be lost." >&2
+      echo "codex-account: run 'codex-account save <name>' first, or 'command codex logout' to discard it." >&2
+      return 1
+    fi
+    mv "$home/auth.json" "$parked" || return 1
+  fi
+
+  if command codex login "$@" && [[ -f "$home/auth.json" ]]; then
+    rm -f "$parked"
+  else
+    echo "codex-account: login failed - restoring the previous login" >&2
+    [[ -f "$parked" ]] && mv "$parked" "$home/auth.json"
+    return 1
+  fi
+
+  if [[ -f "$dir/$name.json" ]]; then
+    old_id=$(_codex_account_id "$dir/$name.json")
+    [[ "$old_id" != "$(_codex_account_id "$home/auth.json")" ]] && echo "codex-account: note: '$name' now points to a different account than before" >&2
+  fi
+  info=$(_codex_account_store "$home" "$dir" "$name") || return 1
+  echo "logged in and saved '$name': $info"
 }
 
 _codex_account_store() {
@@ -111,7 +153,13 @@ Usage:
   codex-account save <name>    save the current login as <name> (fails if it exists)
   codex-account update <name>  overwrite a saved account with the current login
   codex-account remove <name>  delete a saved account (does not log out)
+  codex-account login <name> [codex login args]
+                               log in to another account WITHOUT revoking the
+                               current one, then save it (default: --device-auth)
   codex-account help           show this help
+
+Never run plain 'codex login' or 'codex logout' while a saved account is active:
+both revoke the current refresh token on the server, killing its saved copy.
 
 Accounts are stored in \$CODEX_HOME/accounts (default: ~/.codex/accounts).
 Alias: ca (set CODEX_ACCOUNT_NO_ALIAS=1 before sourcing to disable).
@@ -146,6 +194,12 @@ codex-account() {
       echo "updated '$name': $info"
       return 0 ;;
 
+    login)
+      _codex_account_valid_name "$name" || { echo "usage: codex-account login <name> [codex login args]" >&2; return 1; }
+      shift 2
+      _codex_account_login "$home" "$dir" "$name" "$@"
+      return $? ;;
+
     remove|delete|rm)
       _codex_account_valid_name "$name" || { echo "usage: codex-account remove <name>" >&2; return 1; }
       [[ -f "$dir/$name.json" ]] || { echo "codex-account: no account '$name'" >&2; return 1; }
@@ -165,3 +219,27 @@ codex-account() {
   read -r id email plan < <(_codex_account_info "$home/auth.json")
   echo "codex -> $name: $email ($plan)"
 }
+
+# Guard: plain `codex login` / `codex logout` revoke the live refresh token on the
+# server, which silently kills its saved copy. Intercept them in interactive shells.
+# Disable with CODEX_ACCOUNT_NO_GUARD=1; bypass once with `command codex ...`.
+if [[ -z "${CODEX_ACCOUNT_NO_GUARD:-}" ]]; then
+  codex() {
+    local home; home=$(_codex_account_home)
+    case "${1:-}" in
+      login)
+        if [[ "${2:-}" != "status" && -f "$home/auth.json" ]]; then
+          echo "codex-account: 'codex login' would revoke the current account's token on the server." >&2
+          echo "codex-account: use 'codex-account login <name>' instead, or 'command codex login' to bypass." >&2
+          return 1
+        fi ;;
+      logout)
+        if [[ -f "$home/auth.json" ]]; then
+          echo "codex-account: 'codex logout' revokes the current token; its saved copy would stop working." >&2
+          echo "codex-account: switch with 'codex-account <name>' instead, or 'command codex logout' to really log out." >&2
+          return 1
+        fi ;;
+    esac
+    command codex "$@"
+  }
+fi

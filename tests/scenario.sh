@@ -8,6 +8,19 @@ ACCOUNTS="$CODEX_HOME/accounts"
 FAILS=0
 trap 'rm -rf "$CODEX_HOME"' EXIT
 
+# Fake `codex` binary: records its args and whether auth.json existed, then writes a login.
+FAKEBIN="$CODEX_HOME/bin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/codex" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" > "$CODEX_HOME/fake-args"
+[[ -f "$CODEX_HOME/auth.json" ]] && echo yes > "$CODEX_HOME/fake-auth-present" || echo no > "$CODEX_HOME/fake-auth-present"
+[[ "$1" == "login" ]] || exit 0
+[[ "${FAKE_LOGIN_FAIL:-}" == "1" ]] && exit 1
+printf '%s' "$FAKE_AUTH_JSON" > "$CODEX_HOME/auth.json"
+FAKE
+chmod +x "$FAKEBIN/codex"
+PATH="$FAKEBIN:$PATH"; export PATH
+
 source "$ROOT/codex-account.zsh"
 
 pass() { echo "  ok   $1"; }
@@ -63,6 +76,35 @@ check "delete is a synonym for remove" 'codex-account save work >/dev/null && co
 check "rejects path traversal name" '! codex-account save ../evil 2>/dev/null && [[ ! -f "$CODEX_HOME/evil.json" ]]'
 check "rejects leading-dot name" '! codex-account save .hidden 2>/dev/null'
 check "rejects name with spaces" '! codex-account save "a b" 2>/dev/null'
+
+# --- login: never revoke the live token ---
+login_as AAA personal@example.com pro 7
+rm -f "$ACCOUNTS"/*.json
+check "login refuses when live login is not saved" '! codex-account login work 2>/dev/null && [[ "$(id_of "$CODEX_HOME/auth.json")" == "AAA" ]]'
+codex-account save personal >/dev/null
+login_as AAA personal@example.com pro 8
+FAKE_AUTH_JSON=$(printf '{"tokens":{"account_id":"BBB","id_token":"%s"},"last_refresh":"9"}' "$(jwt work@example.com plus BBB)"); export FAKE_AUTH_JSON
+check "login saves the new account" 'codex-account login work >/dev/null && [[ "$(id_of "$ACCOUNTS/work.json")" == "BBB" ]]'
+check "login parks auth.json so codex has nothing to revoke" '[[ "$(cat "$CODEX_HOME/fake-auth-present")" == "no" ]]'
+check "login passes --device-auth by default" '[[ "$(cat "$CODEX_HOME/fake-args")" == "login --device-auth" ]]'
+check "login synced refreshed tokens of the previous account" '[[ "$(refresh_of "$ACCOUNTS/personal.json")" == "8" ]]'
+check "login leaves the new account live" '[[ "$(id_of "$CODEX_HOME/auth.json")" == "BBB" ]]'
+check "login removes the parked file" '[[ ! -f "$ACCOUNTS/.auth.json.parked" ]]'
+check "login forwards custom codex args" 'codex-account login work2 --foo >/dev/null && [[ "$(cat "$CODEX_HOME/fake-args")" == "login --foo" ]]'
+codex-account remove work2 >/dev/null
+FAKE_LOGIN_FAIL=1; export FAKE_LOGIN_FAIL
+check "failed login restores the previous auth.json" '! codex-account login other 2>/dev/null && [[ "$(id_of "$CODEX_HOME/auth.json")" == "BBB" && ! -f "$ACCOUNTS/other.json" ]]'
+unset FAKE_LOGIN_FAIL
+check "login without name fails" '! codex-account login 2>/dev/null'
+
+# --- guard wrapper ---
+check "guard blocks plain codex login" '! codex login 2>/dev/null && [[ "$(cat "$CODEX_HOME/fake-args")" != "login" ]]'
+check "guard blocks plain codex logout" '! codex logout 2>/dev/null'
+check "guard lets codex login status through" 'codex login status && [[ "$(cat "$CODEX_HOME/fake-args")" == "login status" ]]'
+check "guard lets other commands through" 'codex --version && [[ "$(cat "$CODEX_HOME/fake-args")" == "--version" ]]'
+check "command codex bypasses the guard" 'command codex logout && [[ "$(cat "$CODEX_HOME/fake-args")" == "logout" ]]'
+rm -f "$CODEX_HOME/auth.json"
+check "guard allows login when nothing is logged in" 'codex login && [[ "$(cat "$CODEX_HOME/fake-args")" == "login" ]]'
 
 printf '{"tokens":{}}' > "$CODEX_HOME/auth.json"
 check "broken auth.json still lists" '[[ "$(codex-account)" == *"logged in: ? (?)"* ]]'
