@@ -114,6 +114,10 @@ and remove the `source` line from your shell rc. Your current login in `~/.codex
 tests/run.sh    # runs the scenario under every installed shell (zsh, bash)
 ```
 
+## Author
+
+Made by [Szymon Paluch](https://szymonpaluch.com), who builds AI systems that run in production.
+
 ## License
 
 [MIT](LICENSE)
